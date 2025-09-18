@@ -1,78 +1,77 @@
 # handlers/products.py
-# Модуль отвечает за работу с товарами, корзиной и оформлением заказа
+# Компактный каталог с кнопками "Подробнее" и "🛒" для добавления в корзину
 
 from aiogram import Router, types, F
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from database import get_db_connection
-from cart_store import get_user_cart, add_item, clear_user_cart  # функции для работы с корзиной
 from keyboards.inline_main import get_inline_main_menu
+from html import escape
+import cart_store
 
 router = Router()
 
-# ------------------------------
-# FSM (Finite State Machine) для добавления товара в корзину
-# ------------------------------
-class AddToCart(StatesGroup):
-    waiting_for_quantity = State()  # Ожидание ввода количества
-    selected_product_code = State()  # Код выбранного товара
-    selected_product_name = State()  # Название выбранного товара
-    selected_product_price = State() # Цена выбранного товара
 
 # ------------------------------
-# Команда /products — показать список товаров
+# FSM для добавления товара в корзину
+# ------------------------------
+class AddToCart(StatesGroup):
+    waiting_for_quantity = State()
+    selected_product_code = State()
+    selected_product_name = State()
+    selected_product_price = State()
+
+
+# ------------------------------
+# /products — компактный список товаров
 # ------------------------------
 @router.message(F.text == "/products")
-async def show_products(message: types.Message):
-    """
-    Выводит список товаров из БД с кнопками для добавления в корзину.
-    """
+async def show_products(event: types.Message | types.CallbackQuery):
     conn = await get_db_connection()
-    rows = await conn.fetch("SELECT code, name, price, image_file_id FROM products ORDER BY name")
+    rows = await conn.fetch("SELECT code, name, price FROM products ORDER BY name")
     await conn.close()
 
     if not rows:
-        await message.answer("❌ Товары пока не добавлены.")
+        text = "❌ Товары пока не добавлены."
+        if isinstance(event, types.CallbackQuery):
+            await event.message.edit_text(text)
+        else:
+            await event.answer(text)
         return
 
-    # Формируем inline-клавиатуру с товарами
+    lines = []
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+
     for row in rows:
-        # Кнопка для добавления в корзину
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(
-                    text=f"Добавить в корзину — {row['price']} руб.",
-                    callback_data=f"product_{row['code']}"
-                )]
-            ]
-        )
+        name_html = escape(row["name"])
+        lines.append(f"{name_html} — {row['price']} руб.")
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=name_html, callback_data=f"details_{row['code']}"),
+            InlineKeyboardButton(text="🛒", callback_data=f"add_{row['code']}")
+        ])
 
-        caption = f"<b>{row['name']}</b>\n💰 Цена: {row['price']} руб."
+    text = "\n".join(lines)
 
-        if row["image_file_id"]:
-            # Отправляем фото с подписью и кнопкой
-            await message.answer_photo(
-                photo=row["image_file_id"],
-                caption=caption,
-                reply_markup=markup
-            )
-        else:
-            # Если фото нет — отправляем только текст
-            await message.answer(caption, reply_markup=markup)
+    if isinstance(event, types.CallbackQuery):
+        await event.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await event.reply(text, parse_mode="HTML", reply_markup=kb)
+
+
 
 # ------------------------------
-# Callback: выбор товара из списка
+# Callback: показать карточку товара с фото
 # ------------------------------
-@router.callback_query(F.data.startswith("product_"))
-async def product_selected(callback: types.CallbackQuery, state: FSMContext):
-    """
-    Обрабатывает нажатие на товар, запрашивает количество.
-    """
+@router.callback_query(F.data.startswith("details_"))
+async def product_details(callback: types.CallbackQuery):
     product_code = callback.data.split("_", 1)[1]
 
     conn = await get_db_connection()
-    product = await conn.fetchrow("SELECT code, name, price FROM products WHERE code = $1", product_code)
+    product = await conn.fetchrow(
+        "SELECT code, name, price, image_file_id FROM products WHERE code = $1",
+        product_code
+    )
     await conn.close()
 
     if not product:
@@ -80,28 +79,64 @@ async def product_selected(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # Сохраняем данные о товаре в FSM
+    name_html = escape(product["name"])
+    caption = f"<b>{name_html}</b>\n💰 Цена: {product['price']} руб."
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 В корзину", callback_data=f"add_{product['code']}")]
+    ])
+
+    if product["image_file_id"]:
+        await callback.message.edit_media(
+            media=InputMediaPhoto(
+                media=product["image_file_id"],
+                caption=caption,
+                parse_mode="HTML"
+            ),
+            reply_markup=kb
+        )
+    else:
+        await callback.message.answer(caption, parse_mode="HTML", reply_markup=kb)
+
+    await callback.answer()
+
+
+# ------------------------------
+# Callback: начать добавление в корзину
+# ------------------------------
+@router.callback_query(F.data.startswith("add_"))
+async def add_to_cart_start(callback: types.CallbackQuery, state: FSMContext):
+    product_code = callback.data.split("_", 1)[1]
+
+    conn = await get_db_connection()
+    product = await conn.fetchrow(
+        "SELECT code, name, price FROM products WHERE code = $1",
+        product_code
+    )
+    await conn.close()
+
+    if not product:
+        await callback.message.answer("❌ Товар не найден.")
+        await callback.answer()
+        return
+
     await state.update_data(
         selected_product_code=product["code"],
         selected_product_name=product["name"],
         selected_product_price=product["price"]
     )
 
-    await callback.message.answer(f"Сколько {product['name']} вы хотите добавить?")
-    await state.set_state(AddToCart.waiting_for_quantity)  # Переходим в состояние ожидания количества
+    await callback.message.answer(f"Сколько «{product['name']}» вы хотите добавить?")
+    await state.set_state(AddToCart.waiting_for_quantity)
     await callback.answer()
+
 
 # ------------------------------
 # FSM: получение количества и добавление в корзину
 # ------------------------------
 @router.message(AddToCart.waiting_for_quantity)
 async def get_quantity(message: types.Message, state: FSMContext):
-    """
-    Получает количество товара от пользователя, проверяет корректность ввода,
-    добавляет товар в корзину.
-    """
     try:
-        quantity = int(message.text.strip())  # Преобразуем в число, убираем пробелы
+        quantity = int(message.text.strip())
         if quantity <= 0:
             raise ValueError
     except ValueError:
@@ -109,45 +144,45 @@ async def get_quantity(message: types.Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    product_code = data["selected_product_code"]
-    product_name = data["selected_product_name"]
-    product_price = data["selected_product_price"]
+    cart_store.add_item(
+        message.from_user.id,
+        data["selected_product_code"],
+        data["selected_product_name"],
+        quantity,
+        data["selected_product_price"]
+    )
 
-    user_id = message.from_user.id
-
-    # Добавляем товар в корзину через cart_store
-    add_item(user_id, product_code, product_name, quantity, product_price)
-
-    # Отправляем подтверждение и показываем главное меню
     await message.answer(
-        f"✅ Добавлено {quantity} шт. {product_name} в корзину",
+        f"✅ Добавлено {quantity} шт. {data['selected_product_name']} в корзину",
         reply_markup=get_inline_main_menu()
     )
-    await state.clear()  # Сбрасываем состояние FSM
+    await state.clear()
 
-# ------------------------------
-# Команда /cart — показать содержимое корзины
-# ------------------------------
-@router.message(F.text == "/cart")
-async def show_cart(message: types.Message):
-    """
-    Показывает содержимое корзины пользователя.
-    """
-    user_id = message.from_user.id
-    items = get_user_cart(user_id)
+
+# Показ содержимого корзины (универсально для Message и CallbackQuery)
+async def show_cart(event: types.Message | types.CallbackQuery):
+    if isinstance(event, types.CallbackQuery):
+        user_id = event.from_user.id
+    else:
+        user_id = event.from_user.id
+
+    items = cart_store.get_user_cart(user_id)
 
     if not items:
-        await message.answer("🛒 Ваша корзина пуста.", reply_markup=get_inline_main_menu())
+        text = "🛒 Ваша корзина пуста."
+        if isinstance(event, types.CallbackQuery):
+            await event.message.edit_text(text, parse_mode="HTML", reply_markup=get_inline_main_menu())
+        else:
+            await event.reply(text, parse_mode="HTML", reply_markup=get_inline_main_menu())
         return
 
-    text_lines = ["🛒 Ваша корзина:"]
+    lines = ["🛒 <b>Ваша корзина:</b>"]
     total_sum = 0
     for idx, (code, name, qty, price) in enumerate(items, start=1):
         item_sum = qty * price
         total_sum += item_sum
-        text_lines.append(f"{idx}. {name} — {qty} шт. ({item_sum} руб.)")
-
-    text_lines.append(f"\n💰 Общая сумма: {total_sum} руб.")
+        lines.append(f"{idx}. {escape(name)} — {qty} шт. ({item_sum} руб.)")
+    lines.append(f"\n💰 <b>Итого: {total_sum} руб.</b>")
 
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -156,47 +191,47 @@ async def show_cart(message: types.Message):
         ]
     )
 
-    await message.answer("\n".join(text_lines), reply_markup=markup)
+    text = "\n".join(lines)
 
-# ------------------------------
+    if isinstance(event, types.CallbackQuery):
+        await event.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await event.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
 # Callback: очистка корзины
-# ------------------------------
 @router.callback_query(F.data == "clear_cart")
 async def clear_cart_callback(callback: types.CallbackQuery):
-    """
-    Очищает корзину пользователя.
-    """
-    user_id = callback.from_user.id
-    clear_user_cart(user_id)
-    await callback.message.answer("✅ Корзина очищена", reply_markup=get_inline_main_menu())
+    cart_store.clear_user_cart(callback.from_user.id)
+    await callback.message.edit_text("✅ Корзина очищена", reply_markup=get_inline_main_menu())
     await callback.answer()
 
-# ------------------------------
+
 # Callback: отправка заказа в БД
-# ------------------------------
 @router.callback_query(F.data == "send_order")
 async def send_order(callback: types.CallbackQuery):
-    """
-    Отправляет заказ в базу данных PostgreSQL и очищает корзину.
-    """
     user_id = callback.from_user.id
-    items = get_user_cart(user_id)
+    items = cart_store.get_user_cart(user_id)
 
+    # Если корзина пуста — редактируем текущее сообщение
     if not items:
-        await callback.message.answer("❌ Ваша корзина пуста.")
+        await callback.message.edit_text(
+            "❌ Ваша корзина пуста.",
+            parse_mode="HTML",
+            reply_markup=get_inline_main_menu()
+        )
         await callback.answer()
         return
 
     conn = await get_db_connection()
 
-    # Регистрируем пользователя в БД, если его нет
+    # Добавляем пользователя в таблицу users (если нет)
     await conn.execute("""
         INSERT INTO users (user_id, username, first_name, last_name)
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (user_id) DO NOTHING
     """, user_id, callback.from_user.username, callback.from_user.first_name, callback.from_user.last_name)
 
-    # Считаем общую сумму заказа
     total_sum = sum(qty * price for _, _, qty, price in items)
 
     # Создаём заказ
@@ -216,7 +251,12 @@ async def send_order(callback: types.CallbackQuery):
     await conn.close()
 
     # Очищаем корзину
-    clear_user_cart(user_id)
+    cart_store.clear_user_cart(user_id)
 
-    await callback.message.answer(f"✅ Заказ №{order_id} успешно отправлен!", reply_markup=get_inline_main_menu())
+    # Редактируем текущее сообщение, а не отправляем новое
+    await callback.message.edit_text(
+        f"✅ Заказ №{order_id} успешно отправлен!",
+        parse_mode="HTML",
+        reply_markup=get_inline_main_menu()
+    )
     await callback.answer()

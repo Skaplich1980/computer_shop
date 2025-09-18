@@ -5,95 +5,93 @@
 # перезапуске бота.
 # -------------------------------------------------
 
+import sys
+print("[CART] module key in sys.modules:", __name__)
+
 import json
 import os
+import threading
 from typing import Dict, List, Tuple
 
-# Имя файла, в котором будут храниться все корзины.
-# Здесь указан относительный путь — файл будет создан в текущей рабочей директории.
-# Если нужно хранить рядом с этим модулем, можно сделать:
-# BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# CART_FILE = os.path.join(BASE_DIR, "cart_store.json")
-CART_FILE = "cart_store.json"
+# Фиксируем путь к файлу рядом с модулем (чтобы не зависеть от CWD)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CART_FILE = os.path.join(BASE_DIR, "cart_store.json")
+
+# Потокобезопасность на случай параллельных хендлеров
+_LOCK = threading.RLock()
 
 # Внутреннее хранилище корзин в памяти (RAM).
-# Структура:
-# {
-#   "123456": [ ["cpu", "Процессор", 2, 10000], ["ram", "Память", 1, 5000] ],
-#   "789012": [ ["gpu", "Видеокарта", 1, 30000] ]
-# }
-# Ключ — user_id в виде строки.
-# Значение — список товаров, где каждый товар — список из:
-#   [код товара, название, количество, цена за единицу]
+# Ключ — user_id (str). Значение — список: [код, название, кол-во, цена]
 _cart: Dict[str, List[Tuple[str, str, int, int]]] = {}
 
 
-def load_cart():
-    """
-    Загружает корзины из JSON-файла в память (_cart).
-    Вызывается при старте бота, чтобы восстановить данные после перезапуска.
-    """
+def load_cart() -> None:
+    """Загружает корзины из JSON-файла в память (_cart)."""
     global _cart
-    if os.path.exists(CART_FILE):
-        # Если файл существует — читаем его содержимое
-        with open(CART_FILE, "r", encoding="utf-8") as f:
-            _cart = json.load(f)
-    else:
-        # Если файла нет — начинаем с пустого словаря
-        _cart = {}
+    with _LOCK:
+        if os.path.exists(CART_FILE):
+            try:
+                with open(CART_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # safety: убедимся, что структура валидна
+                if isinstance(data, dict):
+                    _cart = {str(k): list(v) for k, v in data.items()}
+                else:
+                    _cart = {}
+            except Exception:
+                # В проде можно добавить логирование
+                _cart = {}
+        else:
+            _cart = {}
 
 
-def save_cart():
-    """
-    Сохраняет текущее состояние корзин (_cart) в JSON-файл.
-    Вызывается после каждого изменения корзины.
-    """
-    with open(CART_FILE, "w", encoding="utf-8") as f:
-        # ensure_ascii=False — чтобы кириллица сохранялась читаемо
-        # indent=2 — для красивого форматирования
-        json.dump(_cart, f, ensure_ascii=False, indent=2)
+def save_cart() -> None:
+    """Сохраняет текущее состояние корзин (_cart) в JSON-файл."""
+    with _LOCK:
+        tmp_file = CART_FILE + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(_cart, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, CART_FILE)  # атомарная запись
 
 
 def get_user_cart(user_id: int) -> List[Tuple[str, str, int, int]]:
-    """
-    Возвращает корзину конкретного пользователя в виде списка кортежей.
-    Если корзина пустая — вернёт пустой список.
-    """
-    # В JSON мы храним списки, но для удобства работы в коде возвращаем кортежи
-    return [tuple(x) for x in _cart.get(str(user_id), [])]
+    """Возвращает корзину пользователя. Пустой список, если нет."""
+    with _LOCK:
+        data = [tuple(x) for x in _cart.get(str(user_id), [])]
+        print(f"[CART] get_user_cart user={user_id} items={len(data)} file={CART_FILE}")
+        return data
 
 
-def set_user_cart(user_id: int, items: List[Tuple[str, str, int, int]]):
-    """
-    Полностью заменяет корзину пользователя на переданный список товаров.
-    После изменения сразу сохраняет данные в файл.
-    """
-    # Преобразуем кортежи в списки, чтобы их можно было сериализовать в JSON
-    _cart[str(user_id)] = [list(x) for x in items]
+def set_user_cart(user_id: int, items: List[Tuple[str, str, int, int]]) -> None:
+    """Полностью заменяет корзину пользователя и сохраняет на диск."""
+    with _LOCK:
+        _cart[str(user_id)] = [list(x) for x in items]
     save_cart()
 
 
-def clear_user_cart(user_id: int):
-    """
-    Очищает корзину пользователя (делает её пустой).
-    """
-    _cart[str(user_id)] = []
+def clear_user_cart(user_id: int) -> None:
+    """Очищает корзину пользователя и сохраняет на диск."""
+    with _LOCK:
+        _cart[str(user_id)] = []
     save_cart()
 
+def add_item(user_id: int, product_code: str, product_name: str, qty: int, price: int) -> None:
+    """Добавляет товар в корзину пользователя, увеличивает количество если позиция уже есть."""
+    with _LOCK:
+        print(f"[CART] add_item user={user_id} code={product_code} qty={qty} before={len(_cart.get(str(user_id), []))}")
+        items = [tuple(x) for x in _cart.get(str(user_id), [])]
+        for i, (code, name, q, p) in enumerate(items):
+            if code == product_code:
+                items[i] = (code, name, q + qty, p)
+                _cart[str(user_id)] = [list(x) for x in items]
+                save_cart()
+                print(f"[CART] add_item updated, after={len(items)}")
+                return
+        items.append((product_code, product_name, qty, price))
+        _cart[str(user_id)] = [list(x) for x in items]
+    save_cart()
+    print(f"[CART] add_item appended, after={len(items)}")
 
-def add_item(user_id: int, product_code: str, product_name: str, qty: int, price: int):
-    """
-    Добавляет товар в корзину пользователя.
-    Если товар уже есть — увеличивает количество.
-    """
-    items = get_user_cart(user_id)
-    for i, (code, name, q, p) in enumerate(items):
-        if code == product_code:
-            # Если товар уже есть — увеличиваем количество
-            items[i] = (code, name, q + qty, p)
-            set_user_cart(user_id, items)
-            return
-    # Если товара нет — добавляем новую позицию
-    items.append((product_code, product_name, qty, price))
-    set_user_cart(user_id, items)
 
+# Загружаем корзины при импорте модуля
+load_cart()
