@@ -14,4 +14,13 @@ async def cb_view_cart(callback: types.CallbackQuery):
     await show_cart(callback)
     await callback.answer()
 
+# возврат в главное меню
+@router.callback_query(F.data == "back_to_main")
+async def cb_back_to_main(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "🏠 Главное меню",
+        reply_markup=get_inline_main_menu()
+    )
+    await callback.answer()
+
 # clear_cart есть как callback; важно, чтобы callback_data совпадала: "clear_cart"

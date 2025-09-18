@@ -6,12 +6,11 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMedia
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from database import get_db_connection
-from keyboards.inline_main import get_inline_main_menu
+from keyboards.inline_main import *
 from html import escape
 import cart_store
 
 router = Router()
-
 
 # ------------------------------
 # FSM для добавления товара в корзину
@@ -34,10 +33,11 @@ async def show_products(event: types.Message | types.CallbackQuery):
 
     if not rows:
         text = "❌ Товары пока не добавлены."
+        reply_markup = get_inline_main_menu()
         if isinstance(event, types.CallbackQuery):
-            await event.message.edit_text(text)
+            await event.message.edit_text(text, reply_markup=reply_markup)
         else:
-            await event.answer(text)
+            await event.answer(text, reply_markup=reply_markup)
         return
 
     lines = []
@@ -51,13 +51,13 @@ async def show_products(event: types.Message | types.CallbackQuery):
             InlineKeyboardButton(text="🛒", callback_data=f"add_{row['code']}")
         ])
 
+    kb.inline_keyboard.append(get_back_to_main_button())
     text = "\n".join(lines)
 
     if isinstance(event, types.CallbackQuery):
         await event.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     else:
         await event.reply(text, parse_mode="HTML", reply_markup=kb)
-
 
 
 # ------------------------------
@@ -75,7 +75,7 @@ async def product_details(callback: types.CallbackQuery):
     await conn.close()
 
     if not product:
-        await callback.message.answer("❌ Товар не найден.")
+        await callback.message.answer("❌ Товар не найден.", reply_markup=get_inline_main_menu())
         await callback.answer()
         return
 
@@ -84,6 +84,7 @@ async def product_details(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 В корзину", callback_data=f"add_{product['code']}")]
     ])
+    kb.inline_keyboard.append(get_back_to_main_button())
 
     if product["image_file_id"]:
         await callback.message.edit_media(
@@ -95,7 +96,7 @@ async def product_details(callback: types.CallbackQuery):
             reply_markup=kb
         )
     else:
-        await callback.message.answer(caption, parse_mode="HTML", reply_markup=kb)
+        await callback.message.edit_text(caption, parse_mode="HTML", reply_markup=kb)
 
     await callback.answer()
 
@@ -115,7 +116,7 @@ async def add_to_cart_start(callback: types.CallbackQuery, state: FSMContext):
     await conn.close()
 
     if not product:
-        await callback.message.answer("❌ Товар не найден.")
+        await callback.message.answer("❌ Товар не найден.", reply_markup=get_inline_main_menu())
         await callback.answer()
         return
 
@@ -159,21 +160,20 @@ async def get_quantity(message: types.Message, state: FSMContext):
     await state.clear()
 
 
+# ------------------------------
 # Показ содержимого корзины (универсально для Message и CallbackQuery)
+# ------------------------------
 async def show_cart(event: types.Message | types.CallbackQuery):
-    if isinstance(event, types.CallbackQuery):
-        user_id = event.from_user.id
-    else:
-        user_id = event.from_user.id
-
+    user_id = event.from_user.id
     items = cart_store.get_user_cart(user_id)
 
     if not items:
         text = "🛒 Ваша корзина пуста."
+        reply_markup = get_inline_main_menu()
         if isinstance(event, types.CallbackQuery):
-            await event.message.edit_text(text, parse_mode="HTML", reply_markup=get_inline_main_menu())
+            await event.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
         else:
-            await event.reply(text, parse_mode="HTML", reply_markup=get_inline_main_menu())
+            await event.reply(text, parse_mode="HTML", reply_markup=reply_markup)
         return
 
     lines = ["🛒 <b>Ваша корзина:</b>"]
@@ -187,19 +187,21 @@ async def show_cart(event: types.Message | types.CallbackQuery):
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🗑 Очистить корзину", callback_data="clear_cart")],
-            [InlineKeyboardButton(text="📦 Отправить заказ", callback_data="send_order")]
+            [InlineKeyboardButton(text="📦 Отправить заказ", callback_data="send_order")],
+            get_back_to_main_button()
         ]
     )
 
     text = "\n".join(lines)
-
     if isinstance(event, types.CallbackQuery):
         await event.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
     else:
-        await event.answer(text, parse_mode="HTML", reply_markup=markup)
+        await event.reply(text, parse_mode="HTML", reply_markup=markup)
 
 
+# ------------------------------
 # Callback: очистка корзины
+# ------------------------------
 @router.callback_query(F.data == "clear_cart")
 async def clear_cart_callback(callback: types.CallbackQuery):
     cart_store.clear_user_cart(callback.from_user.id)
@@ -207,7 +209,9 @@ async def clear_cart_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
+# ------------------------------
 # Callback: отправка заказа в БД
+# ------------------------------
 @router.callback_query(F.data == "send_order")
 async def send_order(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -224,31 +228,31 @@ async def send_order(callback: types.CallbackQuery):
         return
 
     conn = await get_db_connection()
+    try:
+        # Добавляем пользователя в таблицу users (если нет)
+        await conn.execute("""
+            INSERT INTO users (user_id, username, first_name, last_name)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id) DO NOTHING
+        """, user_id, callback.from_user.username, callback.from_user.first_name, callback.from_user.last_name)
 
-    # Добавляем пользователя в таблицу users (если нет)
-    await conn.execute("""
-        INSERT INTO users (user_id, username, first_name, last_name)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (user_id) DO NOTHING
-    """, user_id, callback.from_user.username, callback.from_user.first_name, callback.from_user.last_name)
+        total_sum = sum(qty * price for _, _, qty, price in items)
 
-    total_sum = sum(qty * price for _, _, qty, price in items)
-
-    # Создаём заказ
-    order_row = await conn.fetchrow(
-        "INSERT INTO orders (user_id, total_price) VALUES ($1, $2) RETURNING order_id",
-        user_id, total_sum
-    )
-    order_id = order_row["order_id"]
-
-    # Добавляем позиции заказа
-    for product_code, _, qty, price in items:
-        await conn.execute(
-            "INSERT INTO order_items (order_id, product_code, quantity, price_per_unit) VALUES ($1, $2, $3, $4)",
-            order_id, product_code, qty, price
+        # Создаём заказ
+        order_row = await conn.fetchrow(
+            "INSERT INTO orders (user_id, total_price) VALUES ($1, $2) RETURNING order_id",
+            user_id, total_sum
         )
+        order_id = order_row["order_id"]
 
-    await conn.close()
+        # Добавляем позиции заказа
+        for product_code, _, qty, price in items:
+            await conn.execute(
+                "INSERT INTO order_items (order_id, product_code, quantity, price_per_unit) VALUES ($1, $2, $3, $4)",
+                order_id, product_code, qty, price
+            )
+    finally:
+        await conn.close()
 
     # Очищаем корзину
     cart_store.clear_user_cart(user_id)

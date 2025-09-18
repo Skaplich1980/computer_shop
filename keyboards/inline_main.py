@@ -8,3 +8,6 @@ def get_inline_main_menu():
         [InlineKeyboardButton(text="🗑 Очистить корзину", callback_data="clear_cart")],
         [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help")]
     ])
+
+def get_back_to_main_button():
+    return [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
